@@ -1,5 +1,6 @@
 streamlit
 opencv-python-headless
 numpy
-mediapipe
+mediapipe==0.10.11
+protobuf==3.20.3
 Pillow
