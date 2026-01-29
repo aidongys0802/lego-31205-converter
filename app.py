@@ -2,8 +2,9 @@ import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image, ImageEnhance
-# --- 1. 基础配置与乐高数据 ---
-st.set_page_config(page_title="LEGO 31205 定制优化版", layout="wide")
+# --- 1. 基础配置 ---
+st.set_page_config(page_title="LEGO 31205 最终完美版", layout="wide")
+# 原始库存数据
 LEGO_31205_DATA = {
    "Black": [(0, 0, 0), 600], "Dark Stone Grey": [(99, 95, 97), 470],
    "Medium Stone Grey": [(150, 152, 152), 370], "White": [(255, 255, 255), 350],
@@ -17,134 +18,199 @@ LEGO_31205_DATA = {
 @st.cache_resource
 def load_face_cascade():
    return cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-# --- 2. 核心算法组件 ---
-def get_closest_color_info(target_rgb, inventory):
-   """找到最接近的颜色"""
-   tr, tg, tb = target_rgb
-   best_dist = float('inf')
-   best_key = "Black"
-   # 只查找，不扣库存
-   for name, data in inventory.items():
-       (r, g, b), count = data
-       if count > 0:
-           dist = (r - tr)**2 + (g - tg)**2 + (b - tb)**2
-           if dist < best_dist:
-               best_dist = dist
-               best_key = name
-   return inventory[best_key][0], best_key
+# --- 2. 智能计算核心 ---
 def detect_face_rect(pil_img):
-   """在图片上检测最大人脸的矩形区域"""
+   """检测人脸，返回 (x, y, w, h)"""
    face_cascade = load_face_cascade()
    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
    if len(faces) > 0:
-       # 返回最大的脸
+       # 找最大的脸
        return sorted(faces, key=lambda x: x[2]*x[3], reverse=True)[0]
    return None
-def smart_crop_by_rect(pil_img, face_rect, zoom_level=1.5):
-   """基于给定的人脸矩形进行智能裁剪"""
-   w, h = pil_img.size
-   if face_rect is not None:
-       fx, fy, fw, fh = face_rect
-       cx, cy = fx + fw // 2, fy + fh // 2
-       crop_dim = int(max(fw, fh) * zoom_level)
-       x1 = max(0, cx - crop_dim // 2)
-       y1 = max(0, cy - crop_dim // 2)
-       x2 = min(w, cx + crop_dim // 2)
-       y2 = min(h, cy + crop_dim // 2)
-       final_dim = min(x2 - x1, y2 - y1)
-       return pil_img.crop((x1, y1, x1+final_dim, y1+final_dim))
-   else:
-       dim = min(w, h)
-       left, top = (w - dim) // 2, (h - dim) // 2
-       return pil_img.crop((left, top, left + dim, top + dim))
-def generate_face_mask_lowres(pil_img_cropped, grid_size):
-   """生成一个低分辨率的 Mask，白色表示人脸核心区域"""
-   # 1. 在高分辨率裁剪图上再次定位人脸
+def generate_priority_mask(pil_img_cropped, grid_size):
+   """生成优先级掩码：True=人脸VIP区域, False=背景"""
    face_rect = detect_face_rect(pil_img_cropped)
-   # 创建全黑高分 Mask
-   mask_hr_np = np.zeros((pil_img_cropped.size[1], pil_img_cropped.size[0]), dtype=np.uint8)
+   mask = np.zeros((grid_size, grid_size), dtype=bool)
    if face_rect is not None:
        fx, fy, fw, fh = face_rect
-       # 稍微向内收缩一点，只保护核心五官区域不抖动，边缘可以稍微过渡
-       inset_x = int(fw * 0.15)
-       inset_y = int(fh * 0.1)
-       # 在 Mask 上绘制白色实心矩形
-       cv2.rectangle(mask_hr_np, (fx+inset_x, fy+inset_y), (fx+fw-inset_x, fy+fh-inset_y), 255, -1)
-   mask_hr_img = Image.fromarray(mask_hr_np)
-   # 2. 使用最近邻插值缩放到网格尺寸，保证边缘锐利
-   mask_lr_img = mask_hr_img.resize((grid_size, grid_size), Image.Resampling.NEAREST)
-   return np.array(mask_lr_img)
-def apply_selective_dithering(pixel_array, face_mask_array, inventory, use_dithering_bg=True):
-   """应用选择性抖动：人脸区域强制平滑，背景可选抖动"""
+       # 将原图坐标映射到 grid_size 坐标
+       scale_x = grid_size / pil_img_cropped.size[0]
+       scale_y = grid_size / pil_img_cropped.size[1]
+       gx = int(fx * scale_x)
+       gy = int(fy * scale_y)
+       gw = int(fw * scale_x)
+       gh = int(fh * scale_y)
+       # 稍微向内收缩，确保VIP区域全是干货
+       pad = 1
+       mask[gy+pad : gy+gh-pad, gx+pad : gx+gw-pad] = True
+   return mask
+def find_best_available_color(target_rgb, inventory):
+   """在有库存的颜色中找最接近的"""
+   tr, tg, tb = target_rgb
+   best_dist = float('inf')
+   best_key = None
+   best_rgb = (0, 0, 0)
+   # 遍历所有颜色，必须 check count > 0
+   available_found = False
+   for name, data in inventory.items():
+       (r, g, b), count = data
+       if count > 0:
+           available_found = True
+           # 加权欧式距离 (人眼对绿色更敏感，修正色彩偏差)
+           dist = 2*(r - tr)**2 + 4*(g - tg)**2 + 3*(b - tb)**2
+           if dist < best_dist:
+               best_dist = dist
+               best_key = name
+               best_rgb = (r, g, b)
+   if not available_found:
+       return (0, 0, 0), "StockOut" # 理论上不应该发生，除非几千个零件全用光
+   return best_rgb, best_key
+def process_priority_allocation(pixel_array, priority_mask, inventory, use_dithering_bg):
+   """
+   两阶段分配算法：
+   1. 优先满足 Priority Mask (人脸)
+   2. 剩余库存满足 背景 (可选抖动)
+   """
    h, w, _ = pixel_array.shape
-   buffer = pixel_array.astype(float)
-   output = np.zeros_like(pixel_array)
-   stats = {}
+   canvas = np.zeros_like(pixel_array)
+   # 记录哪些像素已经填过了
+   filled_map = np.zeros((h, w), dtype=bool)
+   # 复制一份库存用于计算
    temp_inv = {k: [list(v[0]), v[1]] for k, v in inventory.items()}
+   usage_stats = {}
+   # --- 第一阶段：VIP 人脸通道 (绝不抖动，优先选色) ---
    for y in range(h):
        for x in range(w):
-           old_pixel = buffer[y, x]
-           # 如果 mask 对应位置是白色 (255)，则是人脸保护区
-           is_face_protected = face_mask_array[y, x] > 128
-           new_pixel, name = get_closest_color_info(old_pixel, temp_inv)
-           output[y, x] = new_pixel
-           stats[name] = stats.get(name, 0) + 1
-           temp_inv[name][1] -= 1
-           # 关键逻辑：只有当 (开启了背景抖动) 且 (当前像素不在人脸保护区) 时，才扩散误差
-           if use_dithering_bg and not is_face_protected:
-               quant_error = old_pixel - new_pixel
-               if x + 1 < w: buffer[y, x + 1] += quant_error * 7 / 16
-               if y + 1 < h:
-                   if x - 1 >= 0: buffer[y + 1, x - 1] += quant_error * 3 / 16
-                   buffer[y + 1, x] += quant_error * 5 / 16
-                   if x + 1 < w: buffer[y + 1, x + 1] += quant_error * 1 / 16
-   return output, stats
-# --- 3. 界面主逻辑 ---
-st.title("🧩 LEGO 31205 人像定制优化版")
-st.markdown("**优化重点：人脸区域无抖动、肤色统一、五官清晰。**")
-with st.sidebar:
-   st.header("🎛️ 参数面板")
-   grid_size = st.select_slider("画布分辨率 (Grid Size)", options=[32, 48, 64], value=48)
-   st.subheader("1. 构图与预处理")
-   zoom_factor = st.slider("人脸特写程度 (数值越小脸越大)", 1.3, 3.0, 2.0)
-   contrast = st.slider("对比度增强 (提高清晰度)", 0.8, 1.8, 1.3, help="增加对比度有助于让五官与肤色分离得更清晰")
-   brightness = st.slider("亮度调整 (使肤色更浅)", 0.8, 1.5, 1.1, help="适当提高亮度可以让肤色匹配到更浅的积木")
-   st.subheader("2. 质感控制")
-   use_dithering_bg = st.checkbox("背景开启抖动质感", value=True, help="人脸区域将始终保持光滑统一，此选项仅影响背景和衣服。")
-uploaded_file = st.file_uploader("上传照片 (建议面部光线均匀)", type=["jpg", "png", "jpeg"])
+           if priority_mask[y, x]:
+               target = pixel_array[y, x]
+               rgb, name = find_best_available_color(target, temp_inv)
+               if name != "StockOut":
+                   canvas[y, x] = rgb
+                   temp_inv[name][1] -= 1
+                   usage_stats[name] = usage_stats.get(name, 0) + 1
+                   filled_map[y, x] = True
+   # --- 第二阶段：背景通道 (使用剩余库存，可选抖动) ---
+   # 为了支持抖动，我们需要一个 float 类型的 buffer
+   buffer = pixel_array.astype(float)
+   for y in range(h):
+       for x in range(w):
+           # 只有没填过的才处理
+           if not filled_map[y, x]:
+               old_pixel = buffer[y, x]
+               rgb, name = find_best_available_color(old_pixel, temp_inv)
+               if name != "StockOut":
+                   canvas[y, x] = rgb
+                   temp_inv[name][1] -= 1
+                   usage_stats[name] = usage_stats.get(name, 0) + 1
+                   # 只有背景开启抖动时，且当前像素不是边缘，才扩散误差
+                   if use_dithering_bg:
+                       quant_error = old_pixel - rgb
+                       # 误差扩散 (Floyd-Steinberg)
+                       # 注意：不要把误差扩散进“人脸区域”，否则人脸边缘会脏
+                       if x + 1 < w and not priority_mask[y, x+1]:
+                           buffer[y, x + 1] += quant_error * 7 / 16
+                       if y + 1 < h:
+                           if x - 1 >= 0 and not priority_mask[y+1, x-1]:
+                               buffer[y + 1, x - 1] += quant_error * 3 / 16
+                           if not priority_mask[y+1, x]:
+                               buffer[y + 1, x] += quant_error * 5 / 16
+                           if x + 1 < w and not priority_mask[y+1, x+1]:
+                               buffer[y + 1, x + 1] += quant_error * 1 / 16
+   return canvas, usage_stats
+# --- 3. 界面逻辑 ---
+st.title("🧩 LEGO 31205 智能优先版")
+st.markdown("🚀 **核心升级**：库存不足时，优先保证人脸使用最准确的积木颜色。")
+# 使用 Form 解决滑块卡顿问题
+with st.sidebar.form("settings_form"):
+   st.header("🎛️ 参数设置")
+   grid_size = st.select_slider("画布分辨率", options=[32, 48, 64], value=48)
+   st.subheader("1. 图像处理")
+   # 修正：Zoom Level 说明更清晰
+   zoom_factor = st.slider("人脸放大倍数", 1.0, 3.0, 2.0, help="1.0=原图比例，3.0=超大特写")
+   contrast = st.slider("对比度增强", 0.8, 1.8, 1.3)
+   brightness = st.slider("亮度提升", 0.8, 1.5, 1.1)
+   st.subheader("2. 风格化")
+   use_dithering_bg = st.checkbox("背景使用纹理 (抖动)", value=True)
+   # 提交按钮
+   submit_btn = st.form_submit_button("🔨 生成/更新预览")
+uploaded_file = st.file_uploader("上传照片", type=["jpg", "png", "jpeg"])
 if uploaded_file:
-   # 1. 加载与预处理
-   original = Image.open(uploaded_file).convert("RGB")
-   # 调整亮度和对比度
-   enhancer_bri = ImageEnhance.Brightness(original)
+   # 1. 预处理
+   img_raw = Image.open(uploaded_file).convert("RGB")
+   enhancer_bri = ImageEnhance.Brightness(img_raw)
    img_bri = enhancer_bri.enhance(brightness)
    enhancer_con = ImageEnhance.Contrast(img_bri)
    img_processed = enhancer_con.enhance(contrast)
-   # 2. 智能检测与裁剪
+   # 2. 智能裁剪
    face_rect_raw = detect_face_rect(img_processed)
-   img_cropped = smart_crop_by_rect(img_processed, face_rect_raw, zoom_level=zoom_factor)
+   w, h = img_processed.size
+   if face_rect_raw is not None:
+       fx, fy, fw, fh = face_rect_raw
+       cx, cy = fx + fw // 2, fy + fh // 2
+       # 根据放大倍数计算裁剪框
+       crop_dim = int(max(fw, fh) * (4.0 - zoom_factor)) # 修正逻辑：zoom越大，除数越小不太直观，改为反向逻辑适配
+       # 重新写一个更直观的逻辑：
+       # zoom=1.0 -> 裁剪框很大(包含背景)
+       # zoom=3.0 -> 裁剪框很小(只看脸)
+       base_size = max(fw, fh)
+       # 限制最大裁剪框不超过原图短边
+       max_crop = min(w, h)
+       # 限制最小裁剪框不小于人脸
+       min_crop = base_size
+       # 线性插值计算实际裁剪大小
+       # Slider 1.0 -> max_crop
+       # Slider 3.0 -> min_crop
+       t = (zoom_factor - 1.0) / 2.0 # 0.0 to 1.0
+       current_crop_size = int(max_crop - t * (max_crop - min_crop))
+       half_size = current_crop_size // 2
+       x1 = max(0, cx - half_size)
+       y1 = max(0, cy - half_size)
+       x2 = min(w, x1 + current_crop_size)
+       y2 = min(h, y1 + current_crop_size)
+       img_cropped = img_processed.crop((x1, y1, x2, y2))
+   else:
+       # 没脸就居中裁个正方形
+       dim = min(w, h)
+       l, t = (w-dim)//2, (h-dim)//2
+       img_cropped = img_processed.crop((l, t, l+dim, t+dim))
+   # 显示预览图
    col1, col2 = st.columns(2)
    with col1:
-       st.image(img_cropped, caption="预处理与裁剪结果", use_container_width=True)
-   if st.button("生成定制乐高画"):
-       with st.spinner("正在进行分区纹理处理..."):
-           # 3. 生成人脸保护 Mask (低分辨率)
-           face_mask_lr = generate_face_mask_lowres(img_cropped, grid_size)
-           # Debug: 取消下面注释可以预览人脸保护区域
-           # st.image(Image.fromarray(face_mask_lr), caption="人脸保护区预览(白色区域不抖动)", width=200)
-           # 4. 缩放图像并应用选择性抖动
+       st.image(img_cropped, caption="裁剪预览", use_container_width=True)
+   # 只有点击按钮才计算重型逻辑
+   if submit_btn:
+       with st.spinner("正在优先分配人脸积木..."):
+           # 缩放
            img_small = img_cropped.resize((grid_size, grid_size), Image.Resampling.LANCZOS)
            pixel_data = np.array(img_small)
-           final_array, usage = apply_selective_dithering(
-               pixel_data, face_mask_lr, LEGO_31205_DATA, use_dithering_bg
+           # 生成人脸 Mask
+           mask = generate_priority_mask(img_cropped, grid_size)
+           # 运行核心分配逻辑
+           final_canvas, usage = process_priority_allocation(
+               pixel_data, mask, LEGO_31205_DATA, use_dithering_bg
            )
-           result_img = Image.fromarray(final_array.astype('uint8'))
+           res_img = Image.fromarray(final_canvas.astype('uint8'))
            with col2:
-               st.image(result_img.resize((600, 600), Image.Resampling.NEAREST),
-                        caption="最终效果 (人脸光滑优化)", use_container_width=True)
-           st.success("生成完成！脸部区域已自动净化噪点。")
-           with st.expander("查看零件消耗清单"):
-               sorted_usage = sorted(usage.items(), key=lambda x: x[1], reverse=True)
-               st.table([{"零件颜色": k, "使用数量": v, "库存剩余": LEGO_31205_DATA[k][1]-v} for k, v in sorted_usage])
+               st.image(res_img.resize((600, 600), Image.Resampling.NEAREST),
+                        caption="最终效果", use_container_width=True)
+           # 库存预警可视化
+           st.write("---")
+           st.subheader("📊 零件消耗情况")
+           # 将字典转为列表排序
+           usage_list = []
+           for k, v in LEGO_31205_DATA.items():
+               used = usage.get(k, 0)
+               remaining = v[1] - used
+               status = "✅ 充足"
+               if remaining < 0: status = "❌ 缺件 (逻辑错误)" # 理论上不会出现
+               elif remaining == 0: status = "⚠️ 耗尽"
+               elif remaining < 50: status = "📉 紧张"
+               usage_list.append({
+                   "颜色": k,
+                   "已用": used,
+                   "剩余": remaining,
+                   "状态": status
+               })
+           st.dataframe(usage_list, use_container_width=True)
