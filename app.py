@@ -3,9 +3,9 @@ import cv2
 import numpy as np
 from PIL import Image
 import math
-import os
 # --- 1. 配置与乐高 31205 数据 ---
-st.set_page_config(page_title="LEGO 31205 人像转换器 (稳定版)", layout="wide")
+st.set_page_config(page_title="LEGO 31205 人像转换器 (OpenCV 稳定版)", layout="wide")
+# 乐高 31205 (蝙蝠侠) 零件列表：颜色名称 -> [(R, G, B), 数量]
 LEGO_31205_DATA = {
    "Black": [(0, 0, 0), 600],
    "Dark Stone Grey": [(99, 95, 97), 470],
@@ -36,29 +36,35 @@ def get_closest_available(target_rgb, inventory):
    for name, data in inventory.items():
        rgb, count = data
        if count > 0:
+           # 计算欧式距离，找到最接近的颜色
            dist = math.sqrt((r - rgb[0])**2 + (g - rgb[1])**2 + (b - rgb[2])**2)
            candidates.append((dist, name))
    if not candidates:
-       return (0, 0, 0), "Black"
+       return (0, 0, 0), "Black" # 如果所有颜色的库存都用光了，返回黑色
    candidates.sort()
    best_name = candidates[0][1]
-   inventory[best_name][1] -= 1
+   inventory[best_name][1] -= 1 # 消耗一个零件
    return inventory[best_name][0], best_name
 def process_image(pil_img, size, p_weights):
    face_cascade = load_face_cascade()
    # 转换为 RGB 和 Gray
    img_rgb = np.array(pil_img.convert("RGB"))
-   img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+   # 计算裁剪坐标，将图片中心裁剪为正方形
    h, w, _ = img_rgb.shape
    crop_size = min(h, w)
    y0, x0 = (h - crop_size)//2, (w - crop_size)//2
    # 裁剪并缩放
    cropped_rgb = img_rgb[y0:y0+crop_size, x0:x0+crop_size]
-   cropped_gray = img_gray[y0:y0+crop_size, x0:x0+crop_size]
-   # 检测人脸
+   # 在裁剪后的图片上进行人脸检测
+   cropped_gray = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2GRAY)
    faces = face_cascade.detectMultiScale(cropped_gray, 1.1, 4)
-   img_s = cv2.resize(cropped_rgb, (size, size), interpolation=cv2.INTER_AREA)
-   img_hsv = cv2.cvtColor(img_s, cv2.COLOR_RGB2HSV)
+   # 将图片缩放到画布尺寸（例如 48x48）
+   # OpenCV resize 默认输出 BGR 格式
+   img_s_bgr = cv2.resize(cropped_rgb, (size, size), interpolation=cv2.INTER_AREA)
+   # --- 关键修复：将 BGR 转换为 RGB ---
+   img_s_rgb = cv2.cvtColor(img_s_bgr, cv2.COLOR_BGR2RGB)
+   # 用于计算亮度的 HSV 图像
+   img_hsv = cv2.cvtColor(img_s_rgb, cv2.COLOR_RGB2HSV)
    pixel_tasks = []
    for y in range(size):
        for x in range(size):
@@ -69,7 +75,7 @@ def process_image(pil_img, size, p_weights):
                if fx <= rel_x <= fx + fw and fy <= rel_y <= fy + fh:
                    is_face = True
                    break
-           v_val = img_hsv[y, x, 2]
+           v_val = img_hsv[y, x, 2] # 获取亮度值 V
            if is_face:
                score = p_weights['face']
            elif v_val > 200:
@@ -78,9 +84,11 @@ def process_image(pil_img, size, p_weights):
                score = p_weights['bg_dark']
            else:
                score = p_weights['bg_normal']
-           pixel_tasks.append({'pos':(x,y), 'rgb':img_s[y,x], 'score':score})
-   # 分配零件
+           # 这里的 img_s_rgb[y, x] 现在是正确的 RGB 颜色
+           pixel_tasks.append({'pos':(x,y), 'rgb':img_s_rgb[y,x], 'score':score})
+   # 根据优先级排序，优先分配重要区域的颜色
    pixel_tasks.sort(key=lambda t: t['score'], reverse=True)
+   # 复制一份库存数据用于计算
    curr_inv = {k: [v[0], v[1]] for k, v in LEGO_31205_DATA.items()}
    res_pixels = {}
    usage = {}
@@ -88,7 +96,7 @@ def process_image(pil_img, size, p_weights):
        rgb, name = get_closest_available(task['rgb'], curr_inv)
        res_pixels[task['pos']] = rgb
        usage[name] = usage.get(name, 0) + 1
-   # 生成预览
+   # 生成最终的乐高预览图
    out_img = Image.new("RGB", (size, size))
    pix = out_img.load()
    for pos, rgb in res_pixels.items():
@@ -113,8 +121,10 @@ if uploaded_file:
        p_weights = {'face': w_face, 'bg_high': w_high, 'bg_normal': w_normal, 'bg_dark': w_dark}
        result_img, usage_stats = process_image(image, grid_size, p_weights)
        with col2:
+           # 使用 Nearest Neighbor 插值放大，保持像素感
            st.image(result_img.resize((600, 600), resample=0), caption="预览", use_container_width=True)
        st.subheader("📊 零件消耗")
        cols = st.columns(3)
        for i, (name, count) in enumerate(usage_stats.items()):
-           cols[i % 3].metric(name, f"{count} 颗")
+           original_stock = LEGO_31205_DATA[name][1]
+           cols[i % 3].metric(name, f"{count} 颗", f"剩余 {original_stock - count}")
