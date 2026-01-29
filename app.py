@@ -1,12 +1,15 @@
-import os
 import streamlit as st
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.solutions import selfie_segmentation as mp_selfie_seg
-from mediapipe.solutions import face_detection as mp_face_det
 from PIL import Image
 import math
+# 更加健壮的 mediapipe 导入
+try:
+   import mediapipe as mp
+   from mediapipe.solutions import selfie_segmentation as mp_selfie_seg
+   from mediapipe.solutions import face_detection as mp_face_det
+except ImportError:
+   st.error("MediaPipe 核心组件加载失败。这通常是由于系统环境不兼容导致的。")
 # --- 1. 配置与乐高 31205 数据 ---
 st.set_page_config(page_title="LEGO 31205 人像转换器", layout="wide")
 LEGO_31205_DATA = {
@@ -150,3 +153,4 @@ if uploaded_file is not None:
                    cols[i % 3].metric(name, f"{count} 颗", f"剩余 {original_stock - count}")
            else:
                st.error("处理失败，请检查图片格式。")
+
