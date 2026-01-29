@@ -2,9 +2,8 @@ import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image, ImageEnhance
-import random
 st.set_page_config(page_title="LEGO 31205 艺术版", layout="wide")
-# 1. 初始化库存
+# 1. 零件清单
 def get_inventory():
    return {
        "Black": [(0, 0, 0), 600], "Dark Stone Grey": [(99, 95, 97), 470],
@@ -16,72 +15,78 @@ def get_inventory():
        "Red": [(215, 0, 0), 100], "Medium Lavender": [(156, 124, 204), 100],
        "Sand Blue": [(112, 129, 154), 100]
    }
-# 2. 颜色匹配逻辑 (带颗粒度控制)
-def find_color(target_rgb, inv, is_face, dither_strength):
-   tr, tg, tb = target_rgb
-   # 在人脸区域制造随机偏移，诱导 Tan 和 White 混色
-   if is_face and dither_strength > 0:
-       offset = random.uniform(-40, 40) * dither_strength
-       tr, tg, tb = tr + offset, tg + offset, tb + offset
-   # 安全限值，防止乱码
+# 2. 4x4 拜耳矩阵（用于产生整齐的颗粒感）
+BAYER_4X4 = np.array([
+   [ 0,  8,  2, 10],
+   [12,  4, 14,  6],
+   [ 3, 11,  1,  9],
+   [15,  7, 13,  5]
+]) / 16.0
+def match_lego_color(tr, tg, tb, inv, is_skin, dither_val):
+   # 应用结构化抖动偏移
+   tr, tg, tb = tr + dither_val, tg + dither_val, tb + dither_val
    tr, tg, tb = np.clip([tr, tg, tb], 0, 255)
    best_dist = float('inf')
-   best_key = "Black"
+   best_name = "Black"
    for name, (rgb, count) in inv.items():
        if count <= 0: continue
-       # 权重分配：人脸优先使用肤色，背景禁止抢占
        dr, dg, db = rgb[0] - tr, rgb[1] - tg, rgb[2] - tb
        dist = 2*dr**2 + 4*dg**2 + 3*db**2
-       if is_face:
-           if name in ["Flesh", "Tan", "White"]: dist *= 0.4 # 极大权重
+       # 权重控制：面部优先 Flesh/Tan/White
+       if is_skin:
+           if name in ["Flesh", "Tan", "White"]: dist *= 0.5
        else:
-           if name in ["Flesh", "Tan"]: dist *= 10.0 # 背景严禁抢肤色
-           if name == "White": dist *= 2.0 # 背景尽量避开纯白
+           # 背景绝对禁止抢 Flesh/Tan，白色也提高代价
+           if name in ["Flesh", "Tan"]: dist *= 20.0
+           if name == "White": dist *= 3.0
        if dist < best_dist:
-           best_dist, best_key = dist, name
-   inv[best_key][1] -= 1
-   return inv[best_key][0], best_key
-# 3. 界面布局
-st.sidebar.header("🎨 艺术控制面板")
-brightness = st.sidebar.slider("亮度", 0.5, 2.0, 1.1)
-contrast = st.sidebar.slider("对比度 (五官锐度)", 0.5, 2.5, 1.5)
-dither = st.sidebar.slider("面部颗粒混色度", 0.0, 1.0, 0.4)
-zoom = st.sidebar.slider("对焦缩放", 1.0, 3.0, 1.8)
-uploaded_file = st.file_uploader("上传人像", type=["jpg", "png", "jpeg"])
+           best_dist, best_name = dist, name
+   inv[best_name][1] -= 1
+   return inv[best_name][0]
+# --- UI ---
+st.sidebar.header("🎨 核心控制")
+brightness = st.sidebar.slider("亮度 (肤色基调)", 0.5, 2.0, 1.1)
+contrast = st.sidebar.slider("对比度 (五官清晰度)", 0.5, 2.5, 1.4)
+dither_scale = st.sidebar.slider("颗粒抖动强度", 0, 60, 30)
+zoom = st.sidebar.slider("人脸缩放", 1.0, 3.0, 1.8)
+uploaded_file = st.file_uploader("上传人像照片", type=["jpg", "png", "jpeg"])
 if uploaded_file:
    # 预处理
    img = Image.open(uploaded_file).convert("RGB")
    img = ImageEnhance.Brightness(img).enhance(brightness)
    img = ImageEnhance.Contrast(img).enhance(contrast)
-   # 强制裁剪为正方形
+   # 裁剪与缩放
    w, h = img.size
    side = int(min(w, h) / zoom)
    left, top = (w - side) // 2, (h - side) // 2
    img_cropped = img.crop((left, top, left + side, top + side))
-   # 缩放为 48x48 乐高网格
    small = img_cropped.resize((48, 48), Image.Resampling.LANCZOS)
-   pixels = np.array(small, dtype=float) # 使用 float 防止计算溢出
-   # 简单的中心人脸识别 (针对 48x48 优化)
-   # 人脸通常位于图像中心 60% 区域
-   face_range = range(int(48*0.2), int(48*0.8))
+   pixel_data = np.array(small, dtype=float)
+   # 肤色区域识别 (HSV 空间更准确)
+   hsv = cv2.cvtColor(np.array(small), cv2.COLOR_RGB2HSV)
+   # 典型的肤色范围
+   skin_mask = cv2.inRange(hsv, np.array([0, 20, 70]), np.array([25, 255, 255])) > 0
+   # 渲染
    current_inv = {k: [list(v[0]), v[1]] for k, v in get_inventory().items()}
    canvas = np.zeros((48, 48, 3), dtype=np.uint8)
-   # 渲染像素
    for y in range(48):
        for x in range(48):
-           is_face = (y in face_range and x in face_range)
-           # 进行匹配
-           rgb, _ = find_color(pixels[y, x], current_inv, is_face, dither)
+           # 获取当前位置的抖动偏移量
+           bayer_val = BAYER_4X4[y % 4, x % 4] - 0.5
+           dither_offset = bayer_val * dither_scale
+           rgb = match_lego_color(
+               pixel_data[y, x, 0], pixel_data[y, x, 1], pixel_data[y, x, 2],
+               current_inv, skin_mask[y, x], dither_offset
+           )
            canvas[y, x] = rgb
    # 显示结果
    col1, col2 = st.columns(2)
    with col1:
-       st.image(img_cropped, caption="处理预览", use_container_width=True)
+       st.image(img_cropped, use_container_width=True)
    with col2:
-       final_img = Image.fromarray(canvas)
-       st.image(final_img.resize((600, 600), Image.Resampling.NEAREST), caption="乐高艺术转换 (无乱码)", use_container_width=True)
-   # 精确统计
+       res_img = Image.fromarray(canvas)
+       st.image(res_img.resize((600, 600), Image.Resampling.NEAREST), caption="颗粒感抖动效果", use_container_width=True)
+   # 统计
    with st.expander("📊 零件消耗详单"):
        raw = get_inventory()
-       stats = [{"颜色": k, "已用": raw[k][1]-v[1], "剩余": v[1]} for k, v in current_inv.items()]
-       st.table(stats)
+       st.table([{"颜色": k, "已用": raw[k][1]-v[1], "剩余": v[1]} for k, v in current_inv.items()])
